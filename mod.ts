@@ -1,6 +1,7 @@
-import { ensureDir, ensureDirSync, v4, move, MultipartReader, SEP, join } from "./deps.ts";
+import { crypto, ensureFile, join, toWritableStream } from "./deps.ts";
 
 interface UploadOptions {
+  path?: string;
   extensions?: Array<string>;
   maxSizeBytes?: number;
   maxFileSizeBytes?: number;
@@ -11,6 +12,7 @@ interface UploadOptions {
 }
 
 const defaultUploadOptions: UploadOptions = {
+  path: "uploads",
   extensions: [],
   maxSizeBytes: Number.MAX_SAFE_INTEGER,
   maxFileSizeBytes: Number.MAX_SAFE_INTEGER,
@@ -20,137 +22,141 @@ const defaultUploadOptions: UploadOptions = {
   useDateTimeSubDir: true,
 }
 
-const upload = function (
-  path: string,
-  options: UploadOptions = defaultUploadOptions
+function upload(
+  options: UploadOptions = defaultUploadOptions,
 ) {
-  const mergedOptions = Object.assign({}, defaultUploadOptions, options);
-  const { extensions, maxSizeBytes, maxFileSizeBytes, saveFile, readFile, useCurrentDir, useDateTimeSubDir } = mergedOptions;
-  ensureDirSync(join(Deno.cwd(), 'temp_uploads'));
-  return async (context: any, next: any) => {
-    const req = context.request.originalRequest;
-    if (
-      parseInt(req.headers.get("content-length")) > maxSizeBytes!
-    ) {
-      context.throw(
-        422,
-        `Maximum total upload size exceeded, size: ${
-          req.headers.get("content-length")
-        } bytes, maximum: ${maxSizeBytes} bytes. `,
-      );
-      await next();
-    }
-    const boundaryRegex = /^multipart\/form-data;\sboundary=(?<boundary>.*)$/;
-    let match: RegExpMatchArray | null;
-    if (
-      req.headers.get("content-type") &&
-      (match = req.headers.get("content-type")!.match(
-        boundaryRegex,
-      ))
-    ) {
-      const formBoundary: string = match.groups!.boundary;
-      const mr = new MultipartReader(
-        req.body,
-        formBoundary,
-      );
-      const form = await mr.readForm(0);
-      let res: any = {};
-      let entries: any = Array.from(form.entries());
-      let validations = "";
-      for (const item of entries) {
-        let values: any = [].concat(item[1]);
-        for (const val of values) {
-          if (val.filename !== undefined) {
-            if (extensions!.length > 0) {
-              let ext = val.filename.split(".").pop();
-              if (!extensions!.includes(ext)) {
-                validations +=
-                  `The file extension is not allowed (${ext} in ${val.filename}), allowed extensions: ${extensions}. `;
-              }
-            }
-            if (val.size > maxFileSizeBytes!) {
-              validations +=
-                `Maximum file upload size exceeded, file: ${val.filename}, size: ${val.size} bytes, maximum: ${maxFileSizeBytes} bytes. `;
-            }
-          }
-        }
-      }
-      if (validations != "") {
-        await form.removeAll();
-        context.throw(422, validations);
+    const mergedOptions = { ...defaultUploadOptions, ...options };
+    const {
+      path,
+      extensions,
+      maxSizeBytes,
+      maxFileSizeBytes,
+      saveFile,
+      readFile,
+      useCurrentDir,
+    } = mergedOptions;
+
+    return async (context: any, next: any) => {
+      if (parseInt(context.request.headers.get("content-length")!) > maxSizeBytes!) {
+        context.throw(422,
+                  `Maximum total upload size exceeded, size: ${
+                    context.request.headers.get("content-length")
+                  } bytes, maximum: ${maxSizeBytes} bytes. `,
+                 );
         await next();
       }
-      for (const item of entries) {
-        let formField: any = item[0];
-        let filesData: any = [].concat(item[1]);
-        for (const fileData of filesData) {
-          if (fileData.tempfile !== undefined) {
-            let resData = fileData;
-            if (readFile) {
-              resData["data"] = await Deno.readFile(resData["tempfile"]);
-            }
-            if (saveFile) {
-              let uploadPath = path;
-              let uuid = '';
-              if (useDateTimeSubDir) {
-                const d = new Date();
-                uuid = join(
-                  d.getFullYear().toString(),
-                  (d.getMonth()+1).toString(),
-                  d.getDate().toString(),
-                  d.getHours().toString(),
-                  d.getMinutes().toString(),
-                  d.getSeconds().toString(),
-                  v4.generate() //TODO improve to use of v5
-                );
-                uploadPath = join(path,uuid);
-              };
-              let fullPath = uploadPath;
-              if (useCurrentDir) {
-                fullPath = join(Deno.cwd(),fullPath);
+
+      const boundaryRegex = /^multipart\/form-data;\sboundary=(?<boundary>.*)$/;
+      let match: RegExpMatchArray | null;
+
+      if (context.request.headers.get("content-type") &&
+          (match = context.request.headers.get("content-type")!.match(
+            boundaryRegex,
+            )
+        )) {
+        const reqBody = await context.request.body.formData();
+        const res: any = {};
+        let validations = "";
+
+        for (const item of reqBody.entries()) {
+          if (item[1] instanceof File) {
+            if (extensions!.length > 0) {
+              const ext = item[1].name.split(".").pop();
+              if (!extensions!.includes(ext)) {
+                validations += `The file extension is not allowed (${ext} in ${
+                  item[1].name
+                }), allowed extensions: ${extensions}. `;
               }
-              await ensureDir(fullPath);
-              await move(
-                fileData.tempfile,
-                join(fullPath,fileData.filename),
-              );
-              delete resData["tempfile"];
-              resData["id"] = uuid.replace(/\\/g, "/");
-              resData["url"] = encodeURI(
-                join(uploadPath,fileData.filename).replace(/\\/g, "/"),
-              );
-              resData["uri"] = join(fullPath,fileData.filename);
-            } else {
-              let tempFileName = resData.tempfile.split(SEP).pop();
-              let pathTempFile = join(Deno.cwd(),'temp_uploads',tempFileName)
-              await move(
-                resData.tempfile,
-                pathTempFile,
-              );
-              resData.tempfile = pathTempFile;
             }
-            if (res[formField] !== undefined) {
-              if (Array.isArray(res[formField])) {
-                res[formField].push(resData);
-              } else {
-                res[formField] = [res[formField], resData];
-              }
-            } else {
-              res[formField] = resData;
+            if (item[1].size > maxFileSizeBytes!) {
+              validations += `Maximum file upload size exceeded, file: ${
+                item[1].name
+              }, size: ${
+                item[1].size
+              } bytes, maximum: ${maxFileSizeBytes} bytes. `;
             }
           }
+
+          if (validations != "") {
+            context.throw(422, validations);
+            await next();
+          }
+
+          for (const item of reqBody.entries()) {
+            if (item[1] instanceof File) {
+              const formField: any = item[0];
+              const fileData: any = item[1];
+              const resData: any = {
+                name: fileData.name,
+                size: fileData.size,
+              };
+              const d = new Date();
+              var filePath = join(
+                d.getFullYear().toString(),
+                (d.getMonth() + 1).toString(),
+                d.getDate().toString(),
+                d.getHours().toString(),
+                d.getMinutes().toString(),
+                d.getSeconds().toString(),
+                crypto.randomUUID(),
+                fileData.name,
+              );
+
+              if (path) {
+                filePath = join(path!, filePath);
+              }
+
+              if (useCurrentDir) {
+                resData["uri"] = join(Deno.cwd(), filePath);
+              } else {
+                resData["uri"] = filePath;
+              }
+
+              await ensureFile(resData["uri"]);
+              resData["url"] = encodeURI(
+                filePath.replace(/\\/g, "/"),
+              );
+              fileData.stream().pipeTo(
+                toWritableStream(
+                  await Deno.open(resData["uri"], { create: true, write: true }),
+                ),
+              );
+
+              if (readFile) {
+                resData["data"] = await Deno.readFile(resData["uri"]);
+              }
+
+              if (!saveFile) {
+                await Deno.remove(resData["uri"]);
+                delete resData["url"];
+                delete resData["uri"];
+              }
+
+              if (res[formField] !== undefined) {
+                if (Array.isArray(res[formField])) {
+                  res[formField].push(resData);
+                } else {
+                  res[formField] = [res[formField], resData];
+                }
+              } else {
+                res[formField] = resData;
+              }
+
+            }
+          }
+
+          context["uploadedFiles"] = res;
         }
+      } else {
+          context.throw(
+            422,
+            'Invalid upload data, request must contains a body with form "multipart/form-data", and inputs with type="file". ',
+          );
       }
-      context["uploadedFiles"] = res;
-    } else {
-      context.throw(
-        422,
-        'Invalid upload data, request must contains a body with form "multipart/form-data", and inputs with type="file". ',
-      );
+      await next();
     }
-    await next();
-  };
-};
+}
+
 const preUploadValidate = function (
   extensions: Array<string> = [],
   maxSizeBytes: number = Number.MAX_SAFE_INTEGER,
@@ -186,4 +192,5 @@ const preUploadValidate = function (
     await next();
   };
 };
+
 export { upload, preUploadValidate };
